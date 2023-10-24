@@ -132,7 +132,7 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 				panic(err)
 			}
 
-			ch.PublishWithContext(ctx,
+			err = ch.PublishWithContext(ctx,
 				o.Exchange,
 				o.RoutingKey,
 				true,
@@ -141,6 +141,12 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 					Body:      body,
 					MessageId: messageId,
 				})
+
+			if err != nil {
+				a.log.Errorln(err)
+			} else {
+				a.log.Debugw("Message sent", "exchange", o.Exchange, "id", messageId, "payload", string(body))
+			}
 		}
 	}()
 
