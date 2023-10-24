@@ -185,41 +185,47 @@ func (a *amqpConnection) Launch(ctx context.Context) {
 }
 
 func (a *amqpConnection) assertOptions(ch *amqp.Channel, o Options) (err error) {
-	err = ch.ExchangeDeclare(
-		o.Exchange,
-		string(o.Kind),
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
+	if o.Exchange != "" {
+		err = ch.ExchangeDeclare(
+			o.Exchange,
+			string(o.Kind),
+			true,
+			false,
+			false,
+			false,
+			nil,
+		)
 
-	if err != nil {
-		return
+		if err != nil {
+			return
+		}
 	}
 
-	var q amqp.Queue
-	q, err = ch.QueueDeclare(
-		o.Queue,
-		true,
-		false,
-		o.Exclusive,
-		false,
-		nil,
-	)
+	if o.Queue != "" {
+		var q amqp.Queue
+		q, err = ch.QueueDeclare(
+			o.Queue,
+			true,
+			false,
+			o.Exclusive,
+			false,
+			nil,
+		)
 
-	if err != nil {
-		return
+		if err != nil {
+			return
+		}
+
+		if o.Exchange != "" {
+			err = ch.QueueBind(
+				q.Name,
+				o.RoutingKey,
+				o.Exchange,
+				false,
+				nil,
+			)
+		}
 	}
-
-	err = ch.QueueBind(
-		q.Name,
-		o.RoutingKey,
-		o.Exchange,
-		false,
-		nil,
-	)
 
 	return
 }
