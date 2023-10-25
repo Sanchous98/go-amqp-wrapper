@@ -71,7 +71,7 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 	if err != nil {
 		return nil, err
 	}
-
+	_ = ch.Qos(10, 0, false)
 	var o Options
 
 	for _, option := range options {
@@ -84,71 +84,81 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 		panic(err)
 	}
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				message, ok, err := ch.Get(o.Queue, o.AutoAck)
+	if o.Queue != "" {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					message, ok, err := ch.Get(o.Queue, o.AutoAck)
 
-				if err != nil {
-					a.WaitForConnect()
+					if err != nil {
+						a.WaitForConnect()
 
-					ch, err = a.Connection.Channel()
+						ch, err = a.Connection.Channel()
+
+						if err != nil {
+							panic(err)
+						}
+
+						err = a.assertOptions(ch, o)
+
+						if err != nil {
+							panic(err)
+						}
+
+						continue
+					}
+
+					if !ok {
+						continue
+					}
+
+					a.log.Debugw("Message received", "queue", o.Queue, "id", message.MessageId, "payload", string(message.Body))
+					c.rx <- amqpMessage{message, a.unSerializer}
+				}
+			}
+		}()
+	} else {
+		close(c.rx)
+	}
+
+	if o.Exchange != "" {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case message := <-c.tx:
+					messageId := uuid.Must(uuid.NewV4()).String()
+					body, err := a.serializer(message)
 
 					if err != nil {
 						panic(err)
 					}
 
-					err = a.assertOptions(ch, o)
+					err = ch.PublishWithContext(ctx,
+						o.Exchange,
+						o.RoutingKey,
+						true,
+						true,
+						amqp.Publishing{
+							Body:      body,
+							MessageId: messageId,
+						})
 
 					if err != nil {
-						panic(err)
+						a.log.Errorln(err)
+					} else {
+						a.log.Debugw("Message sent", "exchange", o.Exchange, "id", messageId, "payload", string(body))
 					}
-
-					continue
 				}
-
-				if !ok {
-					continue
-				}
-
-				a.log.Debugw("Message received", "queue", o.Queue, "id", message.MessageId, "payload", string(message.Body))
-				c.rx <- amqpMessage{message, a.unSerializer}
 			}
-		}
-	}()
-
-	go func() {
-		select {
-		case <-ctx.Done():
-			return
-		case message := <-c.tx:
-			messageId := uuid.Must(uuid.NewV4()).String()
-			body, err := a.serializer(message)
-
-			if err != nil {
-				panic(err)
-			}
-
-			err = ch.PublishWithContext(ctx,
-				o.Exchange,
-				o.RoutingKey,
-				true,
-				true,
-				amqp.Publishing{
-					Body:      body,
-					MessageId: messageId,
-				})
-
-			if err != nil {
-				a.log.Errorln(err)
-			} else {
-				a.log.Debugw("Message sent", "exchange", o.Exchange, "id", messageId, "payload", string(body))
-			}
-		}
-	}()
+		}()
+	} else {
+		close(c.tx)
+	}
 
 	return c, nil
 }
