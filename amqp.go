@@ -142,7 +142,7 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 						o.Exchange,
 						o.RoutingKey,
 						true,
-						true,
+						false,
 						amqp.Publishing{
 							Body:      body,
 							MessageId: messageId,
