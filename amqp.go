@@ -3,6 +3,7 @@ package go_amqp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gofrs/uuid"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -12,6 +13,7 @@ import (
 
 type ChannelFactory interface {
 	CreateChannel(context.Context, ...Option) (Channel, error)
+	WaitForConnect()
 }
 
 type amqpConnection struct {
@@ -44,7 +46,18 @@ func NewAmqpConnection(dsn string, log Logger, serializer marshaller, unSerializ
 }
 
 func (a *amqpConnection) connect() {
+	a.reconnect.L.Lock()
+	defer a.reconnect.Broadcast()
+	defer a.reconnect.L.Unlock()
+
 	var err error
+
+	if a.Connection != nil {
+		err = a.Connection.CloseDeadline(time.Now().Add(250 * time.Millisecond))
+		if !errors.Is(err, amqp.ErrClosed) {
+			panic(err)
+		}
+	}
 	a.Connection, err = backoff.RetryWithData(func() (*amqp.Connection, error) {
 		a.log.Infoln("Trying to connect")
 		return amqp.Dial(a.dsn)
@@ -61,27 +74,31 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 	a.reconnect.L.Lock()
 	defer a.reconnect.L.Unlock()
 
-	c := &channel{
-		tx: make(chan any),
-		rx: make(chan Message),
-	}
-
 	ch, err := a.Connection.Channel()
 
 	if err != nil {
 		return nil, err
 	}
-	_ = ch.Qos(10, 0, false)
+
 	var o Options
 
 	for _, option := range options {
 		option.apply(&o)
 	}
 
-	err = a.assertOptions(ch, o)
+	if o.Fetch == 0 {
+		o.Fetch = 1
+	}
 
-	if err != nil {
+	_ = ch.Qos(o.Fetch, 0, false)
+
+	if err = a.assertOptions(ch, o); err != nil {
 		panic(err)
+	}
+
+	c := &channel{
+		tx: make(chan any, o.Fetch),
+		rx: make(chan Message, o.Fetch),
 	}
 
 	if o.Queue != "" {
@@ -102,9 +119,7 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 							panic(err)
 						}
 
-						err = a.assertOptions(ch, o)
-
-						if err != nil {
+						if err = a.assertOptions(ch, o); err != nil {
 							panic(err)
 						}
 
@@ -172,10 +187,7 @@ func (a *amqpConnection) WaitForConnect() {
 }
 
 func (a *amqpConnection) Launch(ctx context.Context) {
-	a.reconnect.L.Lock()
 	a.connect()
-	a.reconnect.L.Unlock()
-	a.reconnect.Broadcast()
 
 	for {
 		// This channel is just for notifying the connection loss
@@ -187,15 +199,11 @@ func (a *amqpConnection) Launch(ctx context.Context) {
 
 		select {
 		case <-ctx.Done():
+			_ = a.Connection.CloseDeadline(time.Now().Add(250 * time.Millisecond))
 			return
 		case <-ch.NotifyClose(make(chan *amqp.Error)):
 			a.log.Infoln("Reconnecting")
-			a.reconnect.L.Lock()
-			_ = ch.Close()
-			_ = a.Connection.Close()
 			a.connect()
-			a.reconnect.L.Unlock()
-			a.reconnect.Broadcast()
 		}
 	}
 }

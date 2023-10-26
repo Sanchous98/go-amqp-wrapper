@@ -7,13 +7,6 @@ const (
 	Topic   Kind = "topic"
 )
 
-const (
-	TxOnlyDirection Direction = 1
-	RxOnlyDirection Direction = 2
-	BothDirections  Direction = TxOnlyDirection | RxOnlyDirection
-)
-
-type Direction byte
 type Kind string
 
 type Options struct {
@@ -21,9 +14,9 @@ type Options struct {
 	Exchange   string
 	RoutingKey string
 	Kind       Kind
+	Fetch      int
 	Exclusive  bool
 	AutoAck    bool
-	Direction  Direction
 }
 
 type Option interface {
@@ -32,8 +25,12 @@ type Option interface {
 
 type OptionFunc func(*Options)
 
-func (o OptionFunc) apply(op *Options) {
-	o(op)
+func (o OptionFunc) apply(op *Options) { o(op) }
+
+func Fetch(count uint) Option {
+	return OptionFunc(func(options *Options) {
+		options.Fetch = int(count)
+	})
 }
 
 func RouteTo(routingKey string) Option {
@@ -63,12 +60,6 @@ func BindToExchange(exchange string) Option {
 func Queue(queue string) Option {
 	return OptionFunc(func(options *Options) {
 		options.Queue = queue
-	})
-}
-
-func ChannelDirection(direction Direction) Option {
-	return OptionFunc(func(options *Options) {
-		options.Direction = direction
 	})
 }
 
