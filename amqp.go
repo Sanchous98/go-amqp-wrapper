@@ -13,7 +13,6 @@ import (
 
 type ChannelFactory interface {
 	CreateChannel(context.Context, ...Option) (Channel, error)
-	WaitForConnect()
 }
 
 type amqpConnection struct {
@@ -103,33 +102,26 @@ func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (
 
 	if o.Queue != "" {
 		go func() {
+			messages, err := ch.ConsumeWithContext(
+				ctx,
+				o.Queue,
+				o.RoutingKey,
+				o.AutoAck,
+				o.Exclusive,
+				true,
+				false,
+				nil,
+			)
+
+			if err != nil {
+				panic(err)
+			}
+
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				default:
-					message, ok, err := ch.Get(o.Queue, o.AutoAck)
-
-					if err != nil {
-						a.WaitForConnect()
-
-						ch, err = a.Connection.Channel()
-
-						if err != nil {
-							panic(err)
-						}
-
-						if err = a.assertOptions(ch, o); err != nil {
-							panic(err)
-						}
-
-						continue
-					}
-
-					if !ok {
-						continue
-					}
-
+				case message := <-messages:
 					a.log.Debugw("Message received", "queue", o.Queue, "id", message.MessageId, "payload", string(message.Body))
 					c.rx <- amqpMessage{message, a.unSerializer}
 				}
