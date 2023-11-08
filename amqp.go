@@ -11,11 +11,7 @@ import (
 	"time"
 )
 
-type ChannelFactory interface {
-	CreateChannel(context.Context, ...Option) (Channel, error)
-}
-
-type amqpConnection struct {
+type AmqpConnection struct {
 	*amqp.Connection
 
 	dsn       string
@@ -26,7 +22,7 @@ type amqpConnection struct {
 	unSerializer unMarshaller
 }
 
-func NewAmqpConnection(dsn string, log Logger, serializer marshaller, unSerializer unMarshaller) ChannelFactory {
+func NewAmqpConnection(dsn string, log Logger, serializer marshaller, unSerializer unMarshaller) *AmqpConnection {
 	if serializer == nil {
 		serializer = json.Marshal
 	}
@@ -35,7 +31,7 @@ func NewAmqpConnection(dsn string, log Logger, serializer marshaller, unSerializ
 		unSerializer = json.Unmarshal
 	}
 
-	return &amqpConnection{
+	return &AmqpConnection{
 		dsn:          dsn,
 		log:          log,
 		serializer:   serializer,
@@ -44,7 +40,79 @@ func NewAmqpConnection(dsn string, log Logger, serializer marshaller, unSerializ
 	}
 }
 
-func (a *amqpConnection) connect() {
+func (a *AmqpConnection) CreateChannel(ctx context.Context, options ...Option) (Channel, error) {
+	a.waitForConnect()
+
+	a.reconnect.L.Lock()
+	defer a.reconnect.L.Unlock()
+
+	ch, err := a.Connection.Channel()
+
+	if err != nil {
+		return nil, err
+	}
+
+	o := Build(options)
+
+	if o.Fetch == 0 {
+		o.Fetch = 1
+	}
+
+	_ = ch.Qos(o.Fetch, 0, false)
+
+	if err = a.assertOptions(ch, o); err != nil {
+		panic(err)
+	}
+
+	c := &channel{
+		tx: make(chan any, o.Fetch),
+		rx: make(chan Message, o.Fetch),
+	}
+
+	if o.Queue != "" {
+		go func() {
+			a.consume(ctx, c.rx, ch, o)
+			close(c.rx)
+		}()
+	} else {
+		close(c.rx)
+	}
+
+	if o.Exchange != "" {
+		go func() {
+			a.publish(ctx, c.tx, ch, o)
+			close(c.tx)
+		}()
+	} else {
+		close(c.tx)
+	}
+
+	return c, nil
+}
+
+func (a *AmqpConnection) Launch(ctx context.Context) {
+	a.connect()
+
+	for {
+		// This channel is just for notifying the connection loss
+		ch, err := a.Channel()
+
+		if err != nil {
+			panic(err)
+		}
+
+		select {
+		case <-ctx.Done():
+			_ = a.Connection.CloseDeadline(time.Now().Add(250 * time.Millisecond))
+			return
+		case <-ch.NotifyClose(make(chan *amqp.Error)):
+			a.log.Infoln("Reconnecting")
+			a.connect()
+		}
+	}
+}
+
+func (a *AmqpConnection) connect() {
 	a.reconnect.L.Lock()
 	defer a.reconnect.Broadcast()
 	defer a.reconnect.L.Unlock()
@@ -69,108 +137,52 @@ func (a *amqpConnection) connect() {
 	a.log.Infoln("Connected")
 }
 
-func (a *amqpConnection) CreateChannel(ctx context.Context, options ...Option) (Channel, error) {
-	a.reconnect.L.Lock()
-	defer a.reconnect.L.Unlock()
-
-	ch, err := a.Connection.Channel()
+func (a *AmqpConnection) consume(ctx context.Context, rx chan<- Message, ch *amqp.Channel, o Options) {
+	messages, err := ch.ConsumeWithContext(ctx, o.Queue, o.RoutingKey, o.AutoAck, o.Exclusive, true, false, nil)
 
 	if err != nil {
-		return nil, err
-	}
-
-	var o Options
-
-	for _, option := range options {
-		option.apply(&o)
-	}
-
-	if o.Fetch == 0 {
-		o.Fetch = 1
-	}
-
-	_ = ch.Qos(o.Fetch, 0, false)
-
-	if err = a.assertOptions(ch, o); err != nil {
 		panic(err)
 	}
 
-	c := &channel{
-		tx: make(chan any, o.Fetch),
-		rx: make(chan Message, o.Fetch),
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case message := <-messages:
+			a.log.Debugw("Message received", "queue", o.Queue, "id", message.MessageId, "payload", string(message.Body))
+			rx <- amqpMessage{message, a.unSerializer}
+		}
 	}
+}
 
-	if o.Queue != "" {
-		go func() {
-			messages, err := ch.ConsumeWithContext(
-				ctx,
-				o.Queue,
-				o.RoutingKey,
-				o.AutoAck,
-				o.Exclusive,
-				true,
-				false,
-				nil,
-			)
+func (a *AmqpConnection) publish(ctx context.Context, tx <-chan any, ch *amqp.Channel, o Options) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case message := <-tx:
+			messageId := uuid.Must(uuid.NewV4()).String()
+			body, err := a.serializer(message)
 
 			if err != nil {
 				panic(err)
 			}
 
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case message := <-messages:
-					a.log.Debugw("Message received", "queue", o.Queue, "id", message.MessageId, "payload", string(message.Body))
-					c.rx <- amqpMessage{message, a.unSerializer}
-				}
+			err = ch.PublishWithContext(ctx, o.Exchange, o.RoutingKey, true, false, amqp.Publishing{
+				Body:      body,
+				MessageId: messageId,
+			})
+
+			if err != nil {
+				a.log.Errorln(err)
+			} else {
+				a.log.Debugw("Message sent", "exchange", o.Exchange, "id", messageId, "payload", string(body))
 			}
-		}()
-	} else {
-		close(c.rx)
+		}
 	}
-
-	if o.Exchange != "" {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case message := <-c.tx:
-					messageId := uuid.Must(uuid.NewV4()).String()
-					body, err := a.serializer(message)
-
-					if err != nil {
-						panic(err)
-					}
-
-					err = ch.PublishWithContext(ctx,
-						o.Exchange,
-						o.RoutingKey,
-						true,
-						false,
-						amqp.Publishing{
-							Body:      body,
-							MessageId: messageId,
-						})
-
-					if err != nil {
-						a.log.Errorln(err)
-					} else {
-						a.log.Debugw("Message sent", "exchange", o.Exchange, "id", messageId, "payload", string(body))
-					}
-				}
-			}
-		}()
-	} else {
-		close(c.tx)
-	}
-
-	return c, nil
 }
 
-func (a *amqpConnection) WaitForConnect() {
+func (a *AmqpConnection) waitForConnect() {
 	a.reconnect.L.Lock()
 	if a.Connection == nil || a.Connection.IsClosed() {
 		a.reconnect.Wait()
@@ -178,29 +190,7 @@ func (a *amqpConnection) WaitForConnect() {
 	a.reconnect.L.Unlock()
 }
 
-func (a *amqpConnection) Launch(ctx context.Context) {
-	a.connect()
-
-	for {
-		// This channel is just for notifying the connection loss
-		ch, err := a.Channel()
-
-		if err != nil {
-			panic(err)
-		}
-
-		select {
-		case <-ctx.Done():
-			_ = a.Connection.CloseDeadline(time.Now().Add(250 * time.Millisecond))
-			return
-		case <-ch.NotifyClose(make(chan *amqp.Error)):
-			a.log.Infoln("Reconnecting")
-			a.connect()
-		}
-	}
-}
-
-func (a *amqpConnection) assertOptions(ch *amqp.Channel, o Options) (err error) {
+func (a *AmqpConnection) assertOptions(ch *amqp.Channel, o Options) (err error) {
 	if o.Exchange != "" {
 		err = ch.ExchangeDeclare(
 			o.Exchange,

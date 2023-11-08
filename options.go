@@ -19,6 +19,13 @@ type Options struct {
 	AutoAck    bool
 }
 
+func Build(options []Option) (o Options) {
+	for _, option := range options {
+		option.apply(&o)
+	}
+	return
+}
+
 type Option interface {
 	apply(*Options)
 }
